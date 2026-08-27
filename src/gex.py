@@ -4,7 +4,7 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 
-from src.greeks import bs_gamma, implied_volatility
+from src.greeks import implied_volatility
 
 CONTRACT_MULTIPLIER = 100
 NEW_YORK = ZoneInfo("America/New_York")
@@ -47,22 +47,28 @@ def _clean_side(frame, option_type):
     clean["ask"] = _numeric_column(frame, "ask")
     clean["last_price"] = _numeric_column(frame, "lastPrice")
 
+    if "expiration" in frame.columns:
+        clean["expiration"] = frame["expiration"].astype(str).to_numpy()
+
     clean = clean.dropna(subset=["strike", "open_interest"])
     clean = clean[(clean["strike"] > 0) & (clean["open_interest"] > 0)].copy()
     return clean.reset_index(drop=True)
 
 
-def prepare_chain(calls, puts):
-    """
-    Normalize Yahoo's calls and puts while preserving contracts with valid OI.
-
-    Yahoo occasionally returns missing or placeholder implied-volatility values,
-    especially around stale/delayed snapshots. Those rows are kept here so IV can
-    be recovered later from option prices instead of silently dropping the chain.
-    """
+def prepare_chain(calls, puts, now=None):
+    """Normalize calls and puts while preserving every contract with positive OI."""
     calls_clean = _clean_side(calls, "call")
     puts_clean = _clean_side(puts, "put")
-    return pd.concat([calls_clean, puts_clean], ignore_index=True)
+    chain = pd.concat([calls_clean, puts_clean], ignore_index=True)
+
+    if "expiration" in chain.columns and not chain.empty:
+        t_by_expiry = {
+            expiry: time_to_expiry(expiry, now=now)
+            for expiry in chain["expiration"].dropna().unique()
+        }
+        chain["time_to_expiry"] = chain["expiration"].map(t_by_expiry).astype(float)
+
+    return chain
 
 
 def _mark_price(row):
@@ -77,13 +83,34 @@ def _mark_price(row):
     return np.nan, "missing"
 
 
-def _resolve_implied_volatility(chain, spot, time_to_expiry_years, rate):
+def _ensure_time_column(chain, time_to_expiry_years=None):
     result = chain.copy()
+    if "time_to_expiry" in result.columns:
+        result["time_to_expiry"] = pd.to_numeric(
+            result["time_to_expiry"], errors="coerce"
+        )
+    elif time_to_expiry_years is not None:
+        result["time_to_expiry"] = float(time_to_expiry_years)
+    else:
+        raise ValueError("time to expiry is required")
+
+    result = result[result["time_to_expiry"].gt(0)].copy()
+    return result
+
+
+def _resolve_implied_volatility(
+    chain,
+    spot,
+    rate,
+    time_to_expiry_years=None,
+    fallback_volatility=None,
+    fallback_label="proxy",
+):
+    result = _ensure_time_column(chain, time_to_expiry_years)
     valid_yahoo = result["iv"].between(MIN_VALID_IV, MAX_VALID_IV, inclusive="neither")
     result["iv_source"] = np.where(valid_yahoo, "yahoo", "missing")
 
-    missing_indices = result.index[~valid_yahoo]
-    for idx in missing_indices:
+    for idx in result.index[~valid_yahoo]:
         row = result.loc[idx]
         price, price_source = _mark_price(row)
         if not np.isfinite(price):
@@ -93,7 +120,7 @@ def _resolve_implied_volatility(chain, spot, time_to_expiry_years, rate):
             price,
             spot,
             row["strike"],
-            time_to_expiry_years,
+            row["time_to_expiry"],
             rate,
             row["option_type"],
         )
@@ -101,145 +128,180 @@ def _resolve_implied_volatility(chain, spot, time_to_expiry_years, rate):
             result.at[idx, "iv"] = solved
             result.at[idx, "iv_source"] = f"inferred_{price_source}"
 
-    # If an individual stale price cannot be inverted, use the local smile from
-    # contracts whose IV is usable. This avoids deleting an otherwise valid OI
-    # concentration because one Yahoo field is missing.
-    for option_type in ("call", "put"):
-        side_mask = result["option_type"].eq(option_type)
-        side = result.loc[side_mask].sort_values("strike")
-        resolved = side[side["iv"].between(MIN_VALID_IV, MAX_VALID_IV, inclusive="neither")]
-        unresolved = side[~side["iv"].between(MIN_VALID_IV, MAX_VALID_IV, inclusive="neither")]
-        if unresolved.empty or resolved.empty:
+    group_cols = ["option_type"]
+    if "expiration" in result.columns:
+        group_cols.append("expiration")
+
+    for _, side in result.groupby(group_cols, dropna=False):
+        side = side.sort_values("strike")
+        usable = side[side["iv"].between(MIN_VALID_IV, MAX_VALID_IV, inclusive="neither")]
+        missing = side[~side["iv"].between(MIN_VALID_IV, MAX_VALID_IV, inclusive="neither")]
+        if usable.empty or missing.empty:
             continue
 
-        interpolated = np.interp(
-            unresolved["strike"].to_numpy(),
-            resolved["strike"].to_numpy(),
-            resolved["iv"].to_numpy(),
+        values = np.interp(
+            missing["strike"].to_numpy(),
+            usable["strike"].to_numpy(),
+            usable["iv"].to_numpy(),
         )
-        result.loc[unresolved.index, "iv"] = interpolated
-        result.loc[unresolved.index, "iv_source"] = "interpolated"
+        result.loc[missing.index, "iv"] = values
+        result.loc[missing.index, "iv_source"] = "interpolated"
 
     usable = result["iv"].between(MIN_VALID_IV, MAX_VALID_IV, inclusive="neither")
+    if fallback_volatility is not None:
+        fallback_volatility = float(fallback_volatility)
+        if not MIN_VALID_IV < fallback_volatility < MAX_VALID_IV:
+            raise ValueError("fallback volatility is outside the supported range")
+        missing = ~usable
+        if missing.any():
+            result.loc[missing, "iv"] = fallback_volatility
+            result.loc[missing, "iv_source"] = fallback_label
+            usable = result["iv"].between(MIN_VALID_IV, MAX_VALID_IV, inclusive="neither")
+
     return result.loc[usable].reset_index(drop=True)
 
 
-def add_gamma_exposure(chain, spot, time_to_expiry_years, rate=0.04):
-    """
-    Add signed gamma exposure per 1% underlying move.
+def _gamma_array(spot, strikes, times, volatility, rate):
+    strikes = np.asarray(strikes, dtype=float)
+    times = np.asarray(times, dtype=float)
+    volatility = np.asarray(volatility, dtype=float)
 
-    Sign is a positioning convention: calls positive, puts negative. Open
-    interest does not reveal the dealer side of each trade, so this should be
-    interpreted as a market-positioning proxy rather than literal dealer risk.
-    """
+    sqrt_t = np.sqrt(times)
+    d1 = (
+        np.log(float(spot) / strikes)
+        + (rate + 0.5 * volatility**2) * times
+    ) / (volatility * sqrt_t)
+    pdf = np.exp(-0.5 * d1**2) / np.sqrt(2.0 * np.pi)
+    return pdf / (float(spot) * volatility * sqrt_t)
+
+
+def add_gamma_exposure(
+    chain,
+    spot,
+    time_to_expiry_years=None,
+    rate=0.04,
+    fallback_volatility=None,
+    fallback_label="proxy",
+):
+    """Add signed dollar gamma exposure per 1% move to an option book."""
     if chain.empty:
         raise ValueError("no contracts with positive open interest were returned")
 
-    result = _resolve_implied_volatility(chain, spot, time_to_expiry_years, rate)
+    result = _resolve_implied_volatility(
+        chain,
+        spot,
+        rate,
+        time_to_expiry_years=time_to_expiry_years,
+        fallback_volatility=fallback_volatility,
+        fallback_label=fallback_label,
+    )
     if result.empty:
-        raise ValueError(
-            "Yahoo returned open interest, but no usable or recoverable implied volatility values"
-        )
+        raise ValueError("no usable implied volatility values were available")
 
-    result["gamma"] = result.apply(
-        lambda row: bs_gamma(
-            spot,
-            row["strike"],
-            time_to_expiry_years,
-            rate,
-            row["iv"],
-        ),
-        axis=1,
+    result["gamma"] = _gamma_array(
+        spot,
+        result["strike"].to_numpy(),
+        result["time_to_expiry"].to_numpy(),
+        result["iv"].to_numpy(),
+        rate,
     )
 
     sign = np.where(result["option_type"].eq("call"), 1.0, -1.0)
     result["gex"] = (
         sign
-        * result["gamma"]
-        * result["open_interest"]
+        * result["gamma"].to_numpy()
+        * result["open_interest"].to_numpy()
         * CONTRACT_MULTIPLIER
-        * spot**2
+        * float(spot) ** 2
         * 0.01
     )
     return result
 
 
 def gex_by_strike(chain_with_gex):
-    return (
-        chain_with_gex.groupby("strike", as_index=False)["gex"]
-        .sum()
-        .sort_values("strike")
+    """Return call, put, and net GEX at each strike."""
+    grouped = (
+        chain_with_gex.groupby(["strike", "option_type"], as_index=False)["gex"].sum()
+        .pivot(index="strike", columns="option_type", values="gex")
+        .fillna(0.0)
+        .reset_index()
     )
+    grouped.columns.name = None
+    if "call" not in grouped:
+        grouped["call"] = 0.0
+    if "put" not in grouped:
+        grouped["put"] = 0.0
+    grouped = grouped.rename(columns={"call": "call_gex", "put": "put_gex"})
+    grouped["net_gex"] = grouped["call_gex"] + grouped["put_gex"]
+    return grouped.sort_values("strike").reset_index(drop=True)
 
 
 def find_walls(chain_with_gex):
-    """Return the strikes with the largest call and put gamma concentrations."""
+    """Return call and put wall strikes from the full option book."""
     if chain_with_gex.empty:
         return np.nan, np.nan
 
-    by_type = chain_with_gex.groupby(["option_type", "strike"], as_index=False)["gex"].sum()
-    calls = by_type[by_type["option_type"] == "call"]
-    puts = by_type[by_type["option_type"] == "put"]
+    grouped = chain_with_gex.groupby(["option_type", "strike"], as_index=False)["gex"].sum()
+    calls = grouped[grouped["option_type"].eq("call")]
+    puts = grouped[grouped["option_type"].eq("put")]
 
     call_wall = calls.loc[calls["gex"].idxmax(), "strike"] if not calls.empty else np.nan
     put_wall = puts.loc[puts["gex"].idxmin(), "strike"] if not puts.empty else np.nan
     return float(call_wall), float(put_wall)
 
 
-def total_gex_at_spot(chain, spot, time_to_expiry_years, rate=0.04):
-    exposed = add_gamma_exposure(chain, spot, time_to_expiry_years, rate)
-    return exposed["gex"].sum()
-
-
 def zero_gamma_level(
     chain,
     current_spot,
-    time_to_expiry_years,
+    time_to_expiry_years=None,
     rate=0.04,
-    lower=0.8,
-    upper=1.2,
-    points=161,
+    fallback_volatility=None,
+    fallback_label="proxy",
+    lower=0.82,
+    upper=1.18,
+    points=181,
 ):
-    """Estimate the spot where aggregate signed GEX crosses zero."""
+    """
+    Re-price every contract across a spot grid and find the nearest GEX zero cross.
+
+    Each contract keeps its own expiration and IV. This is the structural gamma
+    flip; it is not a cumulative-by-strike shortcut.
+    """
     if chain.empty:
         return np.nan
 
-    # Resolve IV once at the current spot. Re-solving IV at every hypothetical
-    # spot would change the volatility surface and is not what this scan means.
-    resolved = _resolve_implied_volatility(chain, current_spot, time_to_expiry_years, rate)
+    resolved = _resolve_implied_volatility(
+        chain,
+        current_spot,
+        rate,
+        time_to_expiry_years=time_to_expiry_years,
+        fallback_volatility=fallback_volatility,
+        fallback_label=fallback_label,
+    )
     if resolved.empty:
         return np.nan
 
-    spots = np.linspace(current_spot * lower, current_spot * upper, points)
-    totals = []
-    for candidate_spot in spots:
-        exposed = resolved.copy()
-        exposed["gamma"] = exposed.apply(
-            lambda row: bs_gamma(
-                candidate_spot,
-                row["strike"],
-                time_to_expiry_years,
-                rate,
-                row["iv"],
-            ),
-            axis=1,
-        )
-        sign = np.where(exposed["option_type"].eq("call"), 1.0, -1.0)
-        exposed["gex"] = (
+    strikes = resolved["strike"].to_numpy(dtype=float)
+    times = resolved["time_to_expiry"].to_numpy(dtype=float)
+    volatility = resolved["iv"].to_numpy(dtype=float)
+    open_interest = resolved["open_interest"].to_numpy(dtype=float)
+    sign = np.where(resolved["option_type"].eq("call"), 1.0, -1.0)
+
+    spots = np.linspace(float(current_spot) * lower, float(current_spot) * upper, points)
+    totals = np.empty(points, dtype=float)
+
+    for i, candidate in enumerate(spots):
+        gamma = _gamma_array(candidate, strikes, times, volatility, rate)
+        gex = (
             sign
-            * exposed["gamma"]
-            * exposed["open_interest"]
+            * gamma
+            * open_interest
             * CONTRACT_MULTIPLIER
-            * candidate_spot**2
+            * candidate**2
             * 0.01
         )
-        totals.append(exposed["gex"].sum())
+        totals[i] = gex.sum()
 
-    totals = np.asarray(totals)
-
-    # Only count a genuine sign change. Far from the active strikes, gamma can
-    # numerically underflow to exactly zero; treating that as a zero-gamma level
-    # creates a false crossing at the edge of the scan.
     crossings = np.where((totals[:-1] * totals[1:]) < 0)[0]
     if not len(crossings):
         return np.nan
