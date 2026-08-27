@@ -1,3 +1,6 @@
+from datetime import datetime, time
+from zoneinfo import ZoneInfo
+
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -20,6 +23,26 @@ from src.gex import (
 from src.market_data import load_vrp_data, option_chain, option_expirations
 
 st.set_page_config(page_title="Options Research Dashboard", layout="wide")
+
+NEW_YORK = ZoneInfo("America/New_York")
+
+
+def compact_dollars(value):
+    magnitude = abs(value)
+    if magnitude >= 1e9:
+        return f"${value / 1e9:,.2f}B"
+    if magnitude >= 1e6:
+        return f"${value / 1e6:,.2f}M"
+    if magnitude >= 1e3:
+        return f"${value / 1e3:,.1f}K"
+    return f"${value:,.0f}"
+
+
+def regular_session_is_open(now=None):
+    now = (now or datetime.now(NEW_YORK)).astimezone(NEW_YORK)
+    if now.weekday() >= 5:
+        return False
+    return time(9, 30) <= now.time() < time(16, 0)
 
 
 @st.cache_data(ttl=900, show_spinner=False)
@@ -75,31 +98,51 @@ with gex_tab:
             try:
                 calls, puts, spot = cached_chain(ticker, expiration)
                 t_exp = time_to_expiry(expiration)
-                chain = prepare_chain(calls, puts)
-                chain = add_gamma_exposure(chain, spot, t_exp, rate)
+                raw_contracts = len(calls) + len(puts)
+                chain_with_oi = prepare_chain(calls, puts)
+                chain = add_gamma_exposure(chain_with_oi, spot, t_exp, rate)
                 profile = gex_by_strike(chain)
 
                 lower = spot * (1 - strike_width / 100)
                 upper = spot * (1 + strike_width / 100)
                 visible = profile[profile["strike"].between(lower, upper)]
+                visible_chain = chain[chain["strike"].between(lower, upper)]
 
-                call_wall, put_wall = find_walls(chain[chain["strike"].between(lower, upper)])
-                zero_gamma = zero_gamma_level(chain, spot, t_exp, rate)
+                call_wall, put_wall = find_walls(visible_chain)
+                zero_gamma = zero_gamma_level(chain_with_oi, spot, t_exp, rate)
                 total_gex = chain["gex"].sum()
 
                 m1, m2, m3, m4 = st.columns(4)
                 m1.metric("Spot", f"${spot:,.2f}")
-                m2.metric("Net GEX", f"${total_gex / 1e6:,.1f}M")
+                m2.metric("Net GEX", compact_dollars(total_gex))
                 m3.metric(
                     "Zero gamma",
-                    "N/A" if np.isnan(zero_gamma) else f"${zero_gamma:,.2f}",
+                    "No crossing" if np.isnan(zero_gamma) else f"${zero_gamma:,.2f}",
                 )
                 wall_text = (
                     f"${put_wall:,.0f} / ${call_wall:,.0f}"
                     if not np.isnan(put_wall) and not np.isnan(call_wall)
-                    else "N/A"
+                    else "Unavailable"
                 )
                 m4.metric("Put / call wall", wall_text)
+
+                inferred = int(chain["iv_source"].ne("yahoo").sum())
+                session_text = (
+                    "Regular session open"
+                    if regular_session_is_open()
+                    else "Outside regular session — using Yahoo's latest available snapshot"
+                )
+                st.caption(
+                    f"{session_text} • {raw_contracts:,} contracts returned • "
+                    f"{len(chain_with_oi):,} with positive OI • {len(chain):,} usable for GEX"
+                    + (f" • IV recovered for {inferred:,}" if inferred else "")
+                )
+
+                if inferred:
+                    st.info(
+                        "Some Yahoo implied-volatility fields were missing or placeholders. "
+                        "The dashboard recovered those IVs from option prices or the nearby volatility smile instead of dropping the contracts."
+                    )
 
                 st.plotly_chart(
                     gex_profile_chart(
