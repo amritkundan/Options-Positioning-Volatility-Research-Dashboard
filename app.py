@@ -12,17 +12,10 @@ from src.charts import (
     pnl_histogram,
     vol_comparison_chart,
 )
-from src.gex import (
-    add_gamma_exposure,
-    find_walls,
-    gex_by_strike,
-    prepare_chain,
-    time_to_expiry,
-    zero_gamma_level,
-)
-from src.market_data import load_vrp_data, option_chain, option_expirations
+from src.gex import add_gamma_exposure, find_walls, gex_by_strike, prepare_chain, zero_gamma_level
+from src.market_data import gex_volatility_proxy, load_vrp_data, option_book
 
-st.set_page_config(page_title="Options Research Dashboard", layout="wide")
+st.set_page_config(page_title="Options Gamma Dashboard", page_icon="Γ", layout="wide")
 
 NEW_YORK = ZoneInfo("America/New_York")
 
@@ -32,7 +25,7 @@ def compact_dollars(value):
     if magnitude >= 1e9:
         return f"${value / 1e9:,.2f}B"
     if magnitude >= 1e6:
-        return f"${value / 1e6:,.2f}M"
+        return f"${value / 1e6:,.1f}M"
     if magnitude >= 1e3:
         return f"${value / 1e3:,.1f}K"
     return f"${value:,.0f}"
@@ -40,9 +33,17 @@ def compact_dollars(value):
 
 def regular_session_is_open(now=None):
     now = (now or datetime.now(NEW_YORK)).astimezone(NEW_YORK)
-    if now.weekday() >= 5:
-        return False
-    return time(9, 30) <= now.time() < time(16, 0)
+    return now.weekday() < 5 and time(9, 30) <= now.time() < time(16, 0)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def cached_option_book(ticker, horizon_days, max_expirations):
+    return option_book(ticker, horizon_days=horizon_days, max_expirations=max_expirations)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def cached_gex_volatility_proxy(ticker):
+    return gex_volatility_proxy(ticker)
 
 
 @st.cache_data(ttl=900, show_spinner=False)
@@ -50,117 +51,142 @@ def cached_vrp_data(ticker, vol_ticker, period):
     return load_vrp_data(ticker, vol_ticker, period)
 
 
-@st.cache_data(ttl=300, show_spinner=False)
-def cached_expirations(ticker):
-    return option_expirations(ticker)
+st.title("Options Gamma Dashboard")
+st.caption("Near-term dealer gamma map using public option-chain data. Research only.")
 
+gamma_tab, vrp_tab = st.tabs(["Gamma Map", "Volatility Risk Premium"])
 
-@st.cache_data(ttl=300, show_spinner=False)
-def cached_chain(ticker, expiration):
-    return option_chain(ticker, expiration)
+with gamma_tab:
+    controls, output = st.columns([1, 3.2], gap="large")
 
-
-st.title("Options Positioning & Volatility Research")
-st.caption(
-    "Live gamma-exposure positioning plus a historical volatility-risk-premium proxy. "
-    "Built for research and education, not live execution."
-)
-
-gex_tab, vrp_tab, notes_tab = st.tabs(
-    ["Live GEX", "Volatility Risk Premium", "Methodology"]
-)
-
-with gex_tab:
-    left, right = st.columns([1, 3])
-
-    with left:
+    with controls:
         ticker = st.text_input("Ticker", "SPY").strip().upper()
-        rate = st.number_input(
-            "Risk-free rate",
-            min_value=0.0,
-            max_value=0.20,
-            value=0.04,
-            step=0.005,
-            format="%.3f",
+        horizon_days = st.select_slider(
+            "Book horizon",
+            options=[21, 30, 45, 60],
+            value=45,
+            format_func=lambda x: f"{x} days",
         )
+        max_expirations = st.select_slider(
+            "Expirations to aggregate",
+            options=[8, 12, 16, 20],
+            value=16,
+        )
+        strike_width = st.slider("Chart range around spot", 8, 25, 15, format="±%d%%")
 
-        try:
-            expirations = cached_expirations(ticker)
-            expiration = st.selectbox("Expiration", expirations)
-            strike_width = st.slider("Strike range around spot", 5, 40, 15)
-        except Exception as exc:
-            st.error(f"Could not load expirations: {exc}")
-            expirations = []
-            expiration = None
+        with st.expander("Model settings"):
+            rate = st.number_input(
+                "Risk-free rate",
+                min_value=0.0,
+                max_value=0.20,
+                value=0.04,
+                step=0.005,
+                format="%.3f",
+            )
 
-    with right:
-        if expiration:
+    with output:
+        if ticker:
             try:
-                calls, puts, spot = cached_chain(ticker, expiration)
-                t_exp = time_to_expiry(expiration)
-                raw_contracts = len(calls) + len(puts)
-                chain_with_oi = prepare_chain(calls, puts)
-                chain = add_gamma_exposure(chain_with_oi, spot, t_exp, rate)
-                profile = gex_by_strike(chain)
+                with st.spinner("Building gamma book..."):
+                    calls, puts, spot, expirations, diagnostics = cached_option_book(
+                        ticker,
+                        horizon_days,
+                        max_expirations,
+                    )
+                    book = prepare_chain(calls, puts)
 
-                lower = spot * (1 - strike_width / 100)
-                upper = spot * (1 + strike_width / 100)
-                visible = profile[profile["strike"].between(lower, upper)]
-                visible_chain = chain[chain["strike"].between(lower, upper)]
+                    proxy_vol = None
+                    proxy_label = None
+                    try:
+                        proxy_vol, proxy_label = cached_gex_volatility_proxy(ticker)
+                    except Exception:
+                        pass
 
-                call_wall, put_wall = find_walls(visible_chain)
-                zero_gamma = zero_gamma_level(chain_with_oi, spot, t_exp, rate)
-                total_gex = chain["gex"].sum()
+                    exposed = add_gamma_exposure(
+                        book,
+                        spot,
+                        rate=rate,
+                        fallback_volatility=proxy_vol,
+                        fallback_label=proxy_label or "volatility proxy",
+                    )
+                    profile = gex_by_strike(exposed)
+                    call_wall, put_wall = find_walls(exposed)
+                    gamma_flip = zero_gamma_level(
+                        book,
+                        spot,
+                        rate=rate,
+                        fallback_volatility=proxy_vol,
+                        fallback_label=proxy_label or "volatility proxy",
+                    )
+                    net_gex = float(exposed["gex"].sum())
 
-                m1, m2, m3, m4 = st.columns(4)
+                regime = "Positive Γ" if net_gex >= 0 else "Negative Γ"
+
+                m1, m2, m3, m4, m5 = st.columns(5)
                 m1.metric("Spot", f"${spot:,.2f}")
-                m2.metric("Net GEX", compact_dollars(total_gex))
+                m2.metric("Regime", regime, compact_dollars(net_gex))
                 m3.metric(
-                    "Zero gamma",
-                    "No crossing" if np.isnan(zero_gamma) else f"${zero_gamma:,.2f}",
+                    "Gamma flip",
+                    f"${gamma_flip:,.2f}" if np.isfinite(gamma_flip) else "Outside ±18%",
                 )
-                wall_text = (
-                    f"${put_wall:,.0f} / ${call_wall:,.0f}"
-                    if not np.isnan(put_wall) and not np.isnan(call_wall)
-                    else "Unavailable"
-                )
-                m4.metric("Put / call wall", wall_text)
+                m4.metric("Put wall", f"${put_wall:,.0f}" if np.isfinite(put_wall) else "—")
+                m5.metric("Call wall", f"${call_wall:,.0f}" if np.isfinite(call_wall) else "—")
 
-                inferred = int(chain["iv_source"].ne("yahoo").sum())
-                session_text = (
-                    "Regular session open"
-                    if regular_session_is_open()
-                    else "Outside regular session — using Yahoo's latest available snapshot"
+                low = spot * (1 - strike_width / 100)
+                high = spot * (1 + strike_width / 100)
+
+                if np.isfinite(put_wall) and put_wall >= spot * 0.75:
+                    low = min(low, put_wall - 1)
+                if np.isfinite(call_wall) and call_wall <= spot * 1.25:
+                    high = max(high, call_wall + 1)
+
+                visible = profile[profile["strike"].between(low, high)].copy()
+                st.plotly_chart(
+                    gex_profile_chart(visible, spot, call_wall, put_wall, gamma_flip),
+                    width="stretch",
+                    config={"displayModeBar": False},
                 )
+
+                session = "regular session" if regular_session_is_open() else "latest available snapshot"
+                valid_expiries = sum(
+                    int(row.get("positive_oi_contracts", 0) > 0) for row in diagnostics
+                )
+                yahoo_iv = int(exposed["iv_source"].eq("yahoo").sum())
+                recovered_iv = len(exposed) - yahoo_iv
+                last_expiry = expirations[-1] if expirations else "n/a"
+
                 st.caption(
-                    f"{session_text} • {raw_contracts:,} contracts returned • "
-                    f"{len(chain_with_oi):,} with positive OI • {len(chain):,} usable for GEX"
-                    + (f" • IV recovered for {inferred:,}" if inferred else "")
+                    f"Yahoo Finance {session} • {valid_expiries}/{len(expirations)} expirations with OI "
+                    f"• {len(exposed):,} contracts in model • horizon through {last_expiry}"
+                    + (f" • {recovered_iv:,} IV values recovered/approximated" if recovered_iv else "")
                 )
 
-                if inferred:
-                    st.info(
-                        "Some Yahoo implied-volatility fields were missing or placeholders. "
-                        "The dashboard recovered those IVs from option prices or the nearby volatility smile instead of dropping the contracts."
+                with st.expander("Data quality"):
+                    st.dataframe(pd.DataFrame(diagnostics), width="stretch", hide_index=True)
+                    if proxy_vol is not None:
+                        proxy_rows = int(exposed["iv_source"].eq(proxy_label).sum())
+                        if proxy_rows:
+                            st.write(
+                                f"{proxy_rows:,} contracts used {proxy_label} ({proxy_vol:.1%}) because "
+                                "Yahoo did not provide a usable contract-level IV or quote."
+                            )
+
+                with st.expander("How the levels are calculated"):
+                    st.markdown(
+                        """
+- **GEX:** Black-Scholes gamma × open interest × 100 × spot² × 1%. Calls are positive and puts negative under the standard public dealer-positioning convention.
+- **Call / put wall:** the strikes with the largest call-side and put-side gamma concentration across the aggregated near-term book.
+- **Gamma flip:** every contract is re-priced across a ±18% spot grid using its own expiration and IV; the closest point where total signed GEX changes sign is interpolated.
+- Open interest is not dealer-position data, so these levels are a positioning model rather than observed dealer inventory.
+                        """
                     )
 
-                st.plotly_chart(
-                    gex_profile_chart(
-                        visible,
-                        spot,
-                        call_wall,
-                        put_wall,
-                        zero_gamma,
-                    ),
-                    width="stretch",
-                )
-
-                top = visible.assign(abs_gex=visible["gex"].abs()).nlargest(
-                    12, "abs_gex"
-                )[["strike", "gex"]]
-                st.dataframe(top, width="stretch", hide_index=True)
             except Exception as exc:
-                st.error(f"Could not build the GEX profile: {exc}")
+                st.error(f"Could not build the gamma map: {exc}")
+                st.info(
+                    "Yahoo's free options feed can occasionally return incomplete OI/IV data. "
+                    "Try refreshing once; the model does not replace missing open interest with volume."
+                )
 
 with vrp_tab:
     controls, output = st.columns([1, 3])
@@ -203,55 +229,13 @@ with vrp_tab:
             c1, c2 = st.columns(2)
             with c1:
                 st.plotly_chart(
-                    cumulative_pnl_chart(
-                        results,
-                        side="short" if side == "Short gamma" else "long",
-                    ),
+                    cumulative_pnl_chart(results, side="short" if side == "Short gamma" else "long"),
                     width="stretch",
                 )
             with c2:
                 st.plotly_chart(
-                    pnl_histogram(
-                        results,
-                        side="short" if side == "Short gamma" else "long",
-                    ),
+                    pnl_histogram(results, side="short" if side == "Short gamma" else "long"),
                     width="stretch",
                 )
-
-            yearly = results.assign(year=pd.to_datetime(results["date"]).dt.year)
-            yearly = yearly.groupby("year")[pnl_col].agg(
-                periods="count",
-                avg_pnl="mean",
-                total_pnl="sum",
-                win_rate=lambda x: (x > 0).mean(),
-            )
-            st.subheader("Year-by-year")
-            st.dataframe(yearly, width="stretch")
         except Exception as exc:
             st.error(f"Could not run the historical analysis: {exc}")
-
-with notes_tab:
-    st.markdown(
-        """
-### What this project measures
-
-**Live GEX** aggregates Black-Scholes gamma across the current option chain and
-weights each contract by open interest. Calls are assigned positive exposure and
-puts negative exposure as a common positioning convention.
-
-**Volatility Risk Premium** compares an implied-volatility proxy at each start
-date with the volatility realized over the following window. P&L is a
-gamma-weighted variance-spread approximation, not a historical option-price
-backtest.
-
-### Important limitations
-
-- VIX is a 30-day SPX variance measure, not the exact ATM implied volatility of SPY.
-- Open interest does not identify which side dealers actually hold. Signed GEX is
-  therefore a positioning proxy.
-- The historical module does not include bid/ask spreads, commissions, discrete
-  hedge slippage, dividends, or actual historical option prices.
-- Yahoo Finance data is convenient for a portfolio project, but production
-  research should use a licensed market-data source with point-in-time chains.
-        """
-    )
