@@ -56,32 +56,4 @@ For GEX, calls are assigned positive exposure and puts negative exposure. That i
 
 For the historical module, VIX is used as an implied-volatility proxy. VIX is a 30-day SPX variance measure, not the exact ATM implied volatility of SPY. Because Yahoo Finance does not provide a clean point-in-time history of full option chains, the module is labeled as a **variance-spread / gamma-P&L proxy**, not an actual historical option-price backtest.
 
-A production version would use a licensed point-in-time options database, actual bid/ask quotes, dividends, rates by maturity, transaction costs, and an explicit hedge-execution model.
 
-## Repository structure
-
-```text
-.
-├── app.py
-├── requirements.txt
-├── src/
-│   ├── backtest.py
-│   ├── charts.py
-│   ├── gex.py
-│   ├── greeks.py
-│   └── market_data.py
-├── tests/
-│   ├── test_backtest.py
-│   ├── test_gex.py
-│   └── test_greeks.py
-└── .github/workflows/tests.yml
-```
-
-## Data
-
-Market data is requested through `yfinance`, which is suitable for personal research and demonstration. Review Yahoo's terms before using the data for any other purpose.
-
-
-## GitHub workflow
-
-The repository includes a small GitHub Actions job that runs the unit tests on every push and pull request. That gives the project a visible engineering signal without adding a lot of infrastructure.
